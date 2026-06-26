@@ -7,7 +7,7 @@ object FormulaEvaluator {
     fun colNameToIndex(name: String): Int {
         var result = 0
         val cleaned = name.uppercase(Locale.ROOT).replace("[^A-Z]".toRegex(), "")
-        for (i in 0 until cleaned.length) {
+        for (i in cleaned.indices) {
             result *= 26
             result += cleaned[i] - 'A' + 1
         }
@@ -16,7 +16,7 @@ object FormulaEvaluator {
 
     fun getColName(col: Int): String {
         var temp = col
-        val sb = java.lang.StringBuilder()
+        val sb = StringBuilder()
         while (temp > 0) {
             temp--
             val rem = temp % 26
@@ -31,23 +31,28 @@ object FormulaEvaluator {
         val match = regex.matchEntire(coord.uppercase(Locale.ROOT)) ?: return null
         val colName = match.groupValues[1]
         val rowNum = match.groupValues[2].toIntOrNull() ?: return null
+        if (rowNum <= 0) return null
         val colIndex = colNameToIndex(colName)
+        if (colIndex <= 0) return null
         return Pair(rowNum, colIndex)
     }
 
-    // Expand a range like "A1:B3" into a list of cell coordinates: ["A1", "A2", "A3", "B1", "B2", "B3"]
     fun expandRange(rangeStr: String): List<String> {
         val parts = rangeStr.split(":")
         if (parts.size != 2) return listOf(rangeStr)
-        
-        val start = parseCoordinate(parts[0]) ?: return listOf(rangeStr)
-        val end = parseCoordinate(parts[1]) ?: return listOf(rangeStr)
-        
+
+        val start = parseCoordinate(parts[0].trim()) ?: return listOf(rangeStr)
+        val end = parseCoordinate(parts[1].trim()) ?: return listOf(rangeStr)
+
         val startRow = minOf(start.first, end.first)
         val endRow = maxOf(start.first, end.first)
         val startCol = minOf(start.second, end.second)
         val endCol = maxOf(start.second, end.second)
-        
+
+        // Safety limit: max 10,000 cells in a range
+        val totalCells = (endRow - startRow + 1) * (endCol - startCol + 1)
+        if (totalCells > 10_000) return listOf("#REF!")
+
         val coordinates = mutableListOf<String>()
         for (r in startRow..endRow) {
             for (c in startCol..endCol) {
@@ -57,158 +62,302 @@ object FormulaEvaluator {
         return coordinates
     }
 
-    // Evaluates a specific coordinate on a sheet. Uses visited set to detect infinite loops.
-    fun evaluateCell(coordinate: String, sheet: Sheet, visited: MutableSet<String> = mutableSetOf()): String {
+    fun evaluateCell(
+        coordinate: String,
+        sheet: Sheet,
+        visited: MutableSet<String> = mutableSetOf()
+    ): String {
         val coordUpper = coordinate.uppercase(Locale.ROOT).trim()
-        
-        // Prevent infinite loops/circular references
-        if (visited.contains(coordUpper)) {
-            return "#REF!"
-        }
-        
+
+        if (coordUpper.isBlank()) return ""
+
+        // Circular reference guard
+        if (coordUpper in visited) return "#REF!"
+
         val cell = sheet.cells[coordUpper] ?: return ""
         val rawValue = cell.value.trim()
-        
-        if (!rawValue.startsWith("=")) {
-            return rawValue
-        }
-        
+
+        if (!rawValue.startsWith("=")) return rawValue
+
         visited.add(coordUpper)
         val result = try {
             evaluateFormulaString(rawValue.substring(1), sheet, visited)
+        } catch (e: ArithmeticException) {
+            "#DIV/0!"
         } catch (e: Exception) {
             "#VALUE!"
         }
         visited.remove(coordUpper)
-        
+
         return result
     }
 
-    // Evaluates the formula part (without '=')
-    private fun evaluateFormulaString(formula: String, sheet: Sheet, visited: MutableSet<String>): String {
-        val uppercaseFormula = formula.uppercase(Locale.ROOT).trim()
-        
-        // 1. Check for basic spreadsheet functions
-        val funcRegex = Regex("^([A-Z]+)\\((.*)\\)$")
-        val matchResult = funcRegex.matchEntire(uppercaseFormula)
-        if (matchResult != null) {
-            val funcName = matchResult.groupValues[1]
-            val argsStr = matchResult.groupValues[2]
-            
-            val values = parseArgsAndEvaluate(argsStr, sheet, visited)
-            return when (funcName) {
-                "SUM" -> {
-                    val sum = values.sumOf { it }
-                    if (sum % 1.0 == 0.0) sum.toInt().toString() else String.format(Locale.US, "%.4f", sum).trimEnd('0').trimEnd('.')
-                }
-                "AVERAGE" -> {
-                    if (values.isEmpty()) "0" else {
-                        val avg = values.average()
-                        if (avg % 1.0 == 0.0) avg.toInt().toString() else String.format(Locale.US, "%.4f", avg).trimEnd('0').trimEnd('.')
-                    }
-                }
-                "MIN" -> {
-                    if (values.isEmpty()) "0" else {
-                        val min = values.minOrNull() ?: 0.0
-                        if (min % 1.0 == 0.0) min.toInt().toString() else String.format(Locale.US, "%.4f", min).trimEnd('0').trimEnd('.')
-                    }
-                }
-                "MAX" -> {
-                    if (values.isEmpty()) "0" else {
-                        val max = values.maxOrNull() ?: 0.0
-                        if (max % 1.0 == 0.0) max.toInt().toString() else String.format(Locale.US, "%.4f", max).trimEnd('0').trimEnd('.')
-                    }
-                }
-                "COUNT" -> {
-                    values.size.toString()
-                }
-                else -> "#NAME?"
-            }
+    private fun evaluateFormulaString(
+        formula: String,
+        sheet: Sheet,
+        visited: MutableSet<String>
+    ): String {
+        val upper = formula.uppercase(Locale.ROOT).trim()
+        if (upper.isEmpty()) return ""
+
+        // ── 1. Function call: NAME(args) ──────────────────────────
+        val funcRegex = Regex("^([A-Z]+)\\((.*)\\)$", RegexOption.DOT_MATCHES_ALL)
+        val funcMatch = funcRegex.matchEntire(upper)
+        if (funcMatch != null) {
+            val funcName = funcMatch.groupValues[1]
+            val argsStr = funcMatch.groupValues[2]
+            return evaluateFunction(funcName, argsStr, sheet, visited)
         }
-        
-        // 2. Check for basic arithmetic operators: +, -, *, /
-        for (op in listOf('+', '-', '*', '/')) {
-            val idx = findOperatorSplitIndex(uppercaseFormula, op)
+
+        // ── 2. String concatenation: & operator ───────────────────
+        if (upper.contains("&")) {
+            val idx = upper.indexOf("&")
+            val left = evaluateFormulaString(formula.substring(0, idx).trim(), sheet, visited)
+            val right = evaluateFormulaString(formula.substring(idx + 1).trim(), sheet, visited)
+            return left + right
+        }
+
+        // ── 3. Comparison operators ───────────────────────────────
+        for (op in listOf(">=", "<=", "<>", ">", "<", "=")) {
+            val idx = upper.indexOf(op)
             if (idx != -1) {
-                val leftPart = uppercaseFormula.substring(0, idx).trim()
-                val rightPart = uppercaseFormula.substring(idx + 1).trim()
-                
-                val leftVal = evaluateTerm(leftPart, sheet, visited)
-                val rightVal = evaluateTerm(rightPart, sheet, visited)
-                
-                return when (op) {
-                    '+' -> formatDoubleResult(leftVal + rightVal)
-                    '-' -> formatDoubleResult(leftVal - rightVal)
-                    '*' -> formatDoubleResult(leftVal * rightVal)
-                    '/' -> {
-                        if (rightVal == 0.0) "#DIV/0!" else formatDoubleResult(leftVal / rightVal)
-                    }
-                    else -> "#VALUE!"
+                val left = evaluateTerm(upper.substring(0, idx).trim(), sheet, visited)
+                val right = evaluateTerm(upper.substring(idx + op.length).trim(), sheet, visited)
+                val result = when (op) {
+                    ">=" -> left >= right
+                    "<=" -> left <= right
+                    "<>" -> left != right
+                    ">" -> left > right
+                    "<" -> left < right
+                    "=" -> left == right
+                    else -> false
+                }
+                return if (result) "TRUE" else "FALSE"
+            }
+        }
+
+        // ── 4. Arithmetic: +, -, *, / (right to left, lower precedence first) ──
+        // Addition & Subtraction
+        for (op in listOf('+', '-')) {
+            val idx = findOperatorSplitIndex(upper, op)
+            if (idx > 0) {
+                val leftVal = evaluateArithmetic(upper.substring(0, idx).trim(), sheet, visited)
+                val rightVal = evaluateArithmetic(upper.substring(idx + 1).trim(), sheet, visited)
+                return formatDouble(if (op == '+') leftVal + rightVal else leftVal - rightVal)
+            }
+        }
+
+        // Multiplication & Division
+        for (op in listOf('*', '/')) {
+            val idx = findOperatorSplitIndex(upper, op)
+            if (idx != -1) {
+                val leftVal = evaluateTerm(upper.substring(0, idx).trim(), sheet, visited)
+                val rightVal = evaluateTerm(upper.substring(idx + 1).trim(), sheet, visited)
+                return if (op == '/') {
+                    if (rightVal == 0.0) "#DIV/0!" else formatDouble(leftVal / rightVal)
+                } else {
+                    formatDouble(leftVal * rightVal)
                 }
             }
         }
-        
-        // 3. Simple coordinate lookup or constant
-        return evaluateTerm(uppercaseFormula, sheet, visited).let { formatDoubleResult(it) }
+
+        // ── 5. Single term (coordinate or literal) ────────────────
+        return formatDouble(evaluateTerm(upper, sheet, visited))
+    }
+
+    private fun evaluateFunction(
+        funcName: String,
+        argsStr: String,
+        sheet: Sheet,
+        visited: MutableSet<String>
+    ): String {
+        return when (funcName) {
+            "SUM" -> {
+                val values = parseNumericArgs(argsStr, sheet, visited)
+                formatDouble(values.sum())
+            }
+            "AVERAGE" -> {
+                val values = parseNumericArgs(argsStr, sheet, visited)
+                if (values.isEmpty()) "#DIV/0!" else formatDouble(values.average())
+            }
+            "MIN" -> {
+                val values = parseNumericArgs(argsStr, sheet, visited)
+                if (values.isEmpty()) "0" else formatDouble(values.min())
+            }
+            "MAX" -> {
+                val values = parseNumericArgs(argsStr, sheet, visited)
+                if (values.isEmpty()) "0" else formatDouble(values.max())
+            }
+            "COUNT" -> {
+                parseNumericArgs(argsStr, sheet, visited).size.toString()
+            }
+            "COUNTA" -> {
+                parseAllArgs(argsStr, sheet, visited).count { it.isNotEmpty() }.toString()
+            }
+            "IF" -> {
+                val parts = splitArgs(argsStr)
+                if (parts.size < 2) return "#VALUE!"
+                val condition = evaluateFormulaString(parts[0], sheet, visited)
+                val isTrue = condition.equals("TRUE", ignoreCase = true) ||
+                        condition.toDoubleOrNull()?.let { it != 0.0 } ?: false
+                val branch = if (isTrue) parts.getOrElse(1) { "" } else parts.getOrElse(2) { "" }
+                evaluateFormulaString(branch, sheet, visited)
+            }
+            "ROUND" -> {
+                val parts = splitArgs(argsStr)
+                if (parts.isEmpty()) return "#VALUE!"
+                val num = evaluateTerm(parts[0].trim(), sheet, visited)
+                val decimals = parts.getOrNull(1)?.trim()?.toIntOrNull() ?: 0
+                val factor = Math.pow(10.0, decimals.toDouble())
+                formatDouble(Math.round(num * factor) / factor)
+            }
+            "ABS" -> {
+                val value = evaluateTerm(argsStr.trim(), sheet, visited)
+                formatDouble(Math.abs(value))
+            }
+            "SQRT" -> {
+                val value = evaluateTerm(argsStr.trim(), sheet, visited)
+                if (value < 0) "#NUM!" else formatDouble(Math.sqrt(value))
+            }
+            "POWER" -> {
+                val parts = splitArgs(argsStr)
+                if (parts.size < 2) return "#VALUE!"
+                val base = evaluateTerm(parts[0].trim(), sheet, visited)
+                val exp = evaluateTerm(parts[1].trim(), sheet, visited)
+                formatDouble(Math.pow(base, exp))
+            }
+            "CONCATENATE", "CONCAT" -> {
+                val parts = parseAllArgs(argsStr, sheet, visited)
+                parts.joinToString("")
+            }
+            "LEN" -> {
+                val value = parseAllArgs(argsStr, sheet, visited).firstOrNull() ?: ""
+                value.length.toString()
+            }
+            "UPPER" -> {
+                val value = parseAllArgs(argsStr, sheet, visited).firstOrNull() ?: ""
+                value.uppercase(Locale.ROOT)
+            }
+            "LOWER" -> {
+                val value = parseAllArgs(argsStr, sheet, visited).firstOrNull() ?: ""
+                value.lowercase(Locale.ROOT)
+            }
+            "TRIM" -> {
+                val value = parseAllArgs(argsStr, sheet, visited).firstOrNull() ?: ""
+                value.trim()
+            }
+            else -> "#NAME?"
+        }
     }
 
     private fun findOperatorSplitIndex(formula: String, op: Char): Int {
         var depth = 0
-        // Find operator, ignoring operators inside parentheses
-        for (i in formula.length - 1 downTo 0) {
-            val char = formula[i]
-            if (char == ')') depth++
-            if (char == '(') depth--
-            if (depth == 0 && char == op) {
-                return i
+        for (i in formula.indices.reversed()) {
+            when (formula[i]) {
+                ')' -> depth++
+                '(' -> depth--
             }
+            if (depth == 0 && formula[i] == op) return i
         }
         return -1
     }
 
+    private fun evaluateArithmetic(term: String, sheet: Sheet, visited: MutableSet<String>): Double {
+        // Try multiplication/division first
+        for (op in listOf('*', '/')) {
+            val idx = findOperatorSplitIndex(term, op)
+            if (idx != -1) {
+                val left = evaluateTerm(term.substring(0, idx).trim(), sheet, visited)
+                val right = evaluateTerm(term.substring(idx + 1).trim(), sheet, visited)
+                return if (op == '/') {
+                    if (right == 0.0) Double.NaN else left / right
+                } else left * right
+            }
+        }
+        return evaluateTerm(term, sheet, visited)
+    }
+
     private fun evaluateTerm(term: String, sheet: Sheet, visited: MutableSet<String>): Double {
         if (term.isEmpty()) return 0.0
-        
-        // Is it a number?
         term.toDoubleOrNull()?.let { return it }
-        
-        // Is it a coordinate?
+        if (term == "TRUE") return 1.0
+        if (term == "FALSE") return 0.0
         if (parseCoordinate(term) != null) {
-            val cellVal = evaluateCell(term, sheet, visited)
-            return cellVal.toDoubleOrNull() ?: 0.0
+            return evaluateCell(term, sheet, visited).toDoubleOrNull() ?: 0.0
         }
-        
         return 0.0
     }
 
-    private fun parseArgsAndEvaluate(argsStr: String, sheet: Sheet, visited: MutableSet<String>): List<Double> {
-        val result = mutableListOf<Double>()
-        // Arguments can be separated by commas
-        val args = argsStr.split(",")
-        for (arg in args) {
-            val trimmed = arg.trim()
-            if (trimmed.contains(":")) {
-                // Expanded range
-                val expanded = expandRange(trimmed)
-                for (coord in expanded) {
-                    val evaluated = evaluateCell(coord, sheet, visited)
-                    evaluated.toDoubleOrNull()?.let { result.add(it) }
+    private fun splitArgs(argsStr: String): List<String> {
+        val result = mutableListOf<String>()
+        var depth = 0
+        val current = StringBuilder()
+        for (c in argsStr) {
+            when {
+                c == '(' -> { depth++; current.append(c) }
+                c == ')' -> { depth--; current.append(c) }
+                c == ',' && depth == 0 -> {
+                    result.add(current.toString().trim())
+                    current.clear()
                 }
-            } else if (parseCoordinate(trimmed) != null) {
-                val evaluated = evaluateCell(trimmed, sheet, visited)
-                evaluated.toDoubleOrNull()?.let { result.add(it) }
-            } else {
-                trimmed.toDoubleOrNull()?.let { result.add(it) }
+                else -> current.append(c)
+            }
+        }
+        if (current.isNotEmpty()) result.add(current.toString().trim())
+        return result
+    }
+
+    private fun parseNumericArgs(
+        argsStr: String,
+        sheet: Sheet,
+        visited: MutableSet<String>
+    ): List<Double> {
+        val result = mutableListOf<Double>()
+        for (arg in splitArgs(argsStr)) {
+            val trimmed = arg.trim()
+            when {
+                trimmed.contains(":") -> {
+                    expandRange(trimmed).forEach { coord ->
+                        evaluateCell(coord, sheet, visited).toDoubleOrNull()?.let { result.add(it) }
+                    }
+                }
+                parseCoordinate(trimmed) != null -> {
+                    evaluateCell(trimmed, sheet, visited).toDoubleOrNull()?.let { result.add(it) }
+                }
+                else -> trimmed.toDoubleOrNull()?.let { result.add(it) }
             }
         }
         return result
     }
 
-    private fun formatDoubleResult(num: Double): String {
+    private fun parseAllArgs(
+        argsStr: String,
+        sheet: Sheet,
+        visited: MutableSet<String>
+    ): List<String> {
+        return splitArgs(argsStr).map { arg ->
+            val trimmed = arg.trim()
+            when {
+                trimmed.contains(":") -> {
+                    expandRange(trimmed).joinToString("") { evaluateCell(it, sheet, visited) }
+                }
+                parseCoordinate(trimmed) != null -> evaluateCell(trimmed, sheet, visited)
+                trimmed.startsWith("\"") && trimmed.endsWith("\"") ->
+                    trimmed.substring(1, trimmed.length - 1)
+                else -> trimmed
+            }
+        }
+    }
+
+    private fun formatDouble(num: Double): String {
+        if (num.isNaN()) return "#DIV/0!"
+        if (num.isInfinite()) return "#DIV/0!"
         return if (num % 1.0 == 0.0) {
             num.toLong().toString()
         } else {
-            String.format(Locale.US, "%.4f", num).trimEnd('0').trimEnd('.')
+            String.format(Locale.US, "%.6f", num)
+                .trimEnd('0')
+                .trimEnd('.')
         }
     }
 }
