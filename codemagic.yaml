@@ -1,0 +1,15 @@
+workflows:
+  android-debug:
+    name: Android Debug APK
+    max_build_duration: 60
+    environment:
+      java: 17
+    scripts:
+      - chmod +x ./gradlew
+      - ./gradlew assembleDebug
+    artifacts:
+      - app/build/outputs/**/*.apk
+    cache:
+      cache_paths:
+        - ~/.gradle/caches
+        - ~/.gradle/wrapper

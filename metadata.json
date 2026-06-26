@@ -1,0 +1,6 @@
+{
+  "name": "SheetFlow",
+  "description": "SheetFlow – Offline Spreadsheet Editor. A powerful, modern offline spreadsheet application with 1,048,576 rows and 16,384 columns, formulas, multi-sheet, local file storage, offline templates, custom formatting, undo/redo, auto-save, charts, and more.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
